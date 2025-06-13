@@ -10,11 +10,20 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+type itemStatus int
+
+const (
+	NotStarted itemStatus = iota
+	Started
+	Done
+)
+
 type item struct {
-	text      string
-	checked   bool
-	createdAt time.Time
-	checkedAt *time.Time
+	text           string
+	status         itemStatus
+	createdAt      time.Time
+	checkedAt      *time.Time
+	frozenDuration time.Duration
 }
 
 type model struct {
@@ -22,6 +31,8 @@ type model struct {
 	cursor         int
 	input          textinput.Model
 	viewportHeight int
+	paused         bool
+	pausedAt       time.Time
 }
 
 type tickMsg time.Time
@@ -40,13 +51,12 @@ func initialModel() model {
 	input := textinput.New()
 	input.Placeholder = "Add new item"
 	input.Focus()
-	now := time.Now()
 
 	return model{
 		items: []item{
-			{"Buy milk", false, now, nil},
-			{"Learn Go", false, now, nil},
-			{"Write checklist app", false, now, nil},
+			{"Buy milk", NotStarted, time.Now(), nil, 0},
+			{"Learn Go", NotStarted, time.Now(), nil, 0},
+			{"Write checklist app", NotStarted, time.Now(), nil, 0},
 		},
 		input: input,
 	}
@@ -60,13 +70,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
-
 	case tea.WindowSizeMsg:
 		m.viewportHeight = msg.Height - 4
 		return m, nil
 
 	case tea.KeyMsg:
-		inputIsEmpty := strings.TrimSpace(m.input.Value()) == ""
+		input := strings.TrimSpace(m.input.Value())
+		inputIsEmpty := input == ""
 
 		switch msg.String() {
 		case "ctrl+c":
@@ -88,27 +98,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			text := strings.TrimSpace(m.input.Value())
-			if text != "" {
-				m.items = append(m.items, item{
-					text:      text,
-					checked:   false,
-					createdAt: time.Now(),
-				})
-				m.input.SetValue("")
+			switch input {
+			case "\\q":
+				return m, tea.Quit
+
+			case "\\p":
+				now := time.Now()
+				if !m.paused {
+					m.paused = true
+					m.pausedAt = now
+					for i := range m.items {
+						if m.items[i].status == Started {
+							m.items[i].frozenDuration = time.Since(m.items[i].createdAt)
+						}
+					}
+				} else {
+					elapsedPaused := now.Sub(m.pausedAt)
+					for i := range m.items {
+						if m.items[i].status == Started {
+							m.items[i].createdAt = m.items[i].createdAt.Add(elapsedPaused)
+						}
+					}
+					m.paused = false
+				}
+
+			default:
+				if input != "" {
+					now := time.Now()
+					m.items = append(m.items, item{
+						text:           input,
+						status:         NotStarted,
+						createdAt:      now,
+						frozenDuration: 0,
+					})
+				}
 			}
+			m.input.SetValue("")
 
 		case " ":
-			if inputIsEmpty {
-				if len(m.items) > 0 {
-					i := &m.items[m.cursor]
-					i.checked = !i.checked
-					if i.checked {
-						now := time.Now()
-						i.checkedAt = &now
+			if inputIsEmpty && len(m.items) > 0 {
+				i := &m.items[m.cursor]
+				switch i.status {
+				case NotStarted:
+					i.status = Started
+					if i.frozenDuration > 0 {
+						i.createdAt = time.Now().Add(-i.frozenDuration)
 					} else {
-						i.checkedAt = nil
+						i.createdAt = time.Now()
 					}
+					i.checkedAt = nil
+				case Started:
+					if m.paused {
+						i.checkedAt = ptr(i.createdAt.Add(i.frozenDuration))
+					} else {
+						i.checkedAt = ptr(time.Now())
+					}
+					i.frozenDuration = i.checkedAt.Sub(i.createdAt)
+					i.status = Done
+				case Done:
+					i.status = NotStarted
+					// Do NOT reset createdAt or frozenDuration
 				}
 				return m, nil
 			}
@@ -145,22 +194,38 @@ func (m model) View() string {
 		if i == m.cursor {
 			cursor = ">"
 		}
-		check := "[ ]"
-		if it.checked {
-			check = "[x]"
+		var icon string
+		switch it.status {
+		case NotStarted:
+			icon = "[ ]"
+		case Started:
+			icon = "[>]" // alternative to emoji
+		case Done:
+			icon = "[x]"
 		}
 		var duration time.Duration
-		if it.checkedAt != nil {
-			duration = it.checkedAt.Sub(it.createdAt)
+		if it.status == Done && it.checkedAt != nil {
+			duration = it.frozenDuration
+		} else if it.status == Started {
+			if m.paused {
+				duration = it.frozenDuration
+			} else {
+				duration = time.Since(it.createdAt)
+			}
 		} else {
-			duration = time.Since(it.createdAt)
+			duration = it.frozenDuration
 		}
-		line := fmt.Sprintf("%s %s %s (%s)", cursor, check, it.text, duration.Round(time.Second))
+		line := fmt.Sprintf("%s %s %s (%s)", cursor, icon, it.text, duration.Round(time.Second))
 		b.WriteString(line + "\n")
 	}
 
+	status := ""
+	if m.paused {
+		status = " ⏸ PAUSED"
+	}
+
 	b.WriteString("\n" + m.input.View())
-	b.WriteString("\n\n↑/↓ to move • [Space] to check • [Enter] to add • q to quit")
+	b.WriteString(fmt.Sprintf("\n\n↑/↓ to move • [Space] to toggle status • [Enter] to add • \\q to quit • \\p to pause%s", status))
 	return b.String()
 }
 
