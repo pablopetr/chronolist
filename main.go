@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // <- Aqui estava o erro de sintaxe
+	_ "modernc.org/sqlite"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,15 +21,27 @@ const (
 	Done
 )
 
+type task struct {
+	ID     int64
+	Code   string
+	Title  string
+	Status itemStatus
+}
+
 type item struct {
-	text           string
-	status         itemStatus
-	createdAt      time.Time
-	checkedAt      *time.Time
-	frozenDuration time.Duration
+	ID             int64
+	TaskID         int64
+	Text           string
+	Status         itemStatus
+	CreatedAt      time.Time
+	CheckedAt      *time.Time
+	FrozenDuration time.Duration
 }
 
 type model struct {
+	tasks          []task
+	selectedTaskID int64
+
 	items          []item
 	cursor         int
 	input          textinput.Model
@@ -55,47 +67,76 @@ func openDB() (*sql.DB, error) {
 	return sql.Open("sqlite", "./checklist.db")
 }
 
-func loadItems(db *sql.DB) []item {
-	items := []item{}
-	rows, err := db.Query("SELECT text, status, created_at, checked_at, frozen_duration FROM items")
-	if err != nil {
-		return items
-	}
+func loadTasks(db *sql.DB) []task {
+	tasks := []task{}
+	rows, _ := db.Query("SELECT id, code, title, status FROM tasks")
 	defer rows.Close()
+	for rows.Next() {
+		var t task
+		rows.Scan(&t.ID, &t.Code, &t.Title, &t.Status)
+		tasks = append(tasks, t)
+	}
+	return tasks
+}
 
+func loadItems(db *sql.DB, taskID int64) []item {
+	items := []item{}
+	rows, _ := db.Query("SELECT id, task_id, text, status, created_at, checked_at, frozen_duration FROM items WHERE task_id = ?", taskID)
+	defer rows.Close()
 	for rows.Next() {
 		var it item
 		var createdAt, checkedAtStr string
-		rows.Scan(&it.text, &it.status, &createdAt, &checkedAtStr, &it.frozenDuration)
-		it.createdAt, _ = time.Parse(time.RFC3339, createdAt)
+		rows.Scan(&it.ID, &it.TaskID, &it.Text, &it.Status, &createdAt, &checkedAtStr, &it.FrozenDuration)
+		it.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		if checkedAtStr != "" {
 			t, _ := time.Parse(time.RFC3339, checkedAtStr)
-			it.checkedAt = &t
+			it.CheckedAt = &t
 		}
 		items = append(items, it)
 	}
 	return items
 }
 
-func saveItem(db *sql.DB, it item) {
-	var checkedAtStr string
-	if it.checkedAt != nil {
-		checkedAtStr = it.checkedAt.Format(time.RFC3339)
-	}
-	_, _ = db.Exec(`
-		INSERT INTO items (text, status, created_at, checked_at, frozen_duration)
-		VALUES (?, ?, ?, ?, ?)
-	`, it.text, it.status, it.createdAt.Format(time.RFC3339), checkedAtStr, it.frozenDuration)
+func saveTask(db *sql.DB, code, title string) {
+	db.Exec("INSERT INTO tasks (code, title, status) VALUES (?, ?, ?)", code, title, NotStarted)
 }
 
-func updateItem(db *sql.DB, it item) {
+func deleteTask(db *sql.DB, taskID int64) {
+	db.Exec("DELETE FROM items WHERE task_id = ?", taskID)
+	db.Exec("DELETE FROM tasks WHERE id = ?", taskID)
+}
+
+func deleteItem(db *sql.DB, itemID int64) {
+	db.Exec("DELETE FROM items WHERE id = ?", itemID)
+}
+
+func saveItem(db *sql.DB, it item) {
 	var checkedAtStr string
-	if it.checkedAt != nil {
-		checkedAtStr = it.checkedAt.Format(time.RFC3339)
+	if it.CheckedAt != nil {
+		checkedAtStr = it.CheckedAt.Format(time.RFC3339)
 	}
-	_, _ = db.Exec(`
-		UPDATE items SET status=?, created_at=?, checked_at=?, frozen_duration=? WHERE text=?
-	`, it.status, it.createdAt.Format(time.RFC3339), checkedAtStr, it.frozenDuration, it.text)
+	db.Exec(`INSERT INTO items (task_id, text, status, created_at, checked_at, frozen_duration) VALUES (?, ?, ?, ?, ?, ?)`,
+		it.TaskID, it.Text, it.Status, it.CreatedAt.Format(time.RFC3339), checkedAtStr, it.FrozenDuration)
+}
+
+func updateTaskStatus(db *sql.DB, taskID int64) {
+	var total, done, started int
+	row := db.QueryRow("SELECT COUNT(*) FROM items WHERE task_id = ?", taskID)
+	row.Scan(&total)
+	row = db.QueryRow("SELECT COUNT(*) FROM items WHERE task_id = ? AND status = ?", taskID, Done)
+	row.Scan(&done)
+	row = db.QueryRow("SELECT COUNT(*) FROM items WHERE task_id = ? AND status = ?", taskID, Started)
+	row.Scan(&started)
+
+	var newStatus itemStatus
+	if done == total && total > 0 {
+		newStatus = Done
+	} else if started > 0 || done > 0 {
+		newStatus = Started
+	} else {
+		newStatus = NotStarted
+	}
+	db.Exec("UPDATE tasks SET status = ? WHERE id = ?", newStatus, taskID)
 }
 
 func initialModel() model {
@@ -104,28 +145,26 @@ func initialModel() model {
 		fmt.Println("Failed to open DB:", err)
 		os.Exit(1)
 	}
-
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS items (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			text TEXT,
-			status INTEGER,
-			created_at TEXT,
-			checked_at TEXT,
-			frozen_duration INTEGER
-		);
-	`)
-	if err != nil {
-		fmt.Println("Failed to create table:", err)
-		os.Exit(1)
-	}
-
+	db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		code TEXT,
+		title TEXT,
+		status INTEGER
+	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id INTEGER,
+		text TEXT,
+		status INTEGER,
+		created_at TEXT,
+		checked_at TEXT,
+		frozen_duration INTEGER
+	)`)
 	input := textinput.New()
-	input.Placeholder = "Add new item"
+	input.Placeholder = "Add new task"
 	input.Focus()
-
 	return model{
-		items: loadItems(db),
+		tasks: loadTasks(db),
 		input: input,
 		db:    db,
 	}
@@ -137,119 +176,113 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.viewportHeight = msg.Height - 4
 		return m, nil
-
 	case tea.KeyMsg:
 		input := strings.TrimSpace(m.input.Value())
-		inputIsEmpty := input == ""
-
+		if input == "\\q" {
+			return m, tea.Quit
+		} else if input == "\\d" {
+			if m.selectedTaskID == 0 && len(m.tasks) > 0 {
+				taskID := m.tasks[m.cursor].ID
+				deleteTask(m.db, taskID)
+				m.tasks = loadTasks(m.db)
+				if m.cursor > 0 {
+					m.cursor--
+				}
+				m.input.SetValue("")
+				return m, nil
+			} else if m.selectedTaskID != 0 && len(m.items) > 0 {
+				itemID := m.items[m.cursor].ID
+				deleteItem(m.db, itemID)
+				m.items = loadItems(m.db, m.selectedTaskID)
+				updateTaskStatus(m.db, m.selectedTaskID)
+				if m.cursor > 0 {
+					m.cursor--
+				}
+				m.input.SetValue("")
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
-
-		case "q":
-			if inputIsEmpty {
-				return m, tea.Quit
+		case "enter":
+			if m.selectedTaskID == 0 {
+				if len(m.tasks) > 0 && input == "" {
+					m.selectedTaskID = m.tasks[m.cursor].ID
+					m.items = loadItems(m.db, m.selectedTaskID)
+					m.input.Placeholder = "Add new item"
+					m.input.SetValue("")
+					m.cursor = 0
+				} else if input != "" {
+					saveTask(m.db, fmt.Sprintf("T%02d", len(m.tasks)+1), input)
+					m.tasks = loadTasks(m.db)
+					m.input.SetValue("")
+				}
+			} else {
+				if input != "" {
+					it := item{
+						TaskID:    m.selectedTaskID,
+						Text:      input,
+						Status:    NotStarted,
+						CreatedAt: time.Now(),
+					}
+					saveItem(m.db, it)
+					m.items = loadItems(m.db, m.selectedTaskID)
+					updateTaskStatus(m.db, m.selectedTaskID)
+					m.input.SetValue("")
+				}
 			}
-
+		case "esc":
+			m.selectedTaskID = 0
+			m.items = nil
+			m.input.Placeholder = "Add new task"
+			m.input.SetValue("")
+			m.tasks = loadTasks(m.db)
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-
 		case "down":
-			if m.cursor < len(m.items)-1 {
+			if m.selectedTaskID == 0 && m.cursor < len(m.tasks)-1 {
+				m.cursor++
+			} else if m.selectedTaskID != 0 && m.cursor < len(m.items)-1 {
 				m.cursor++
 			}
-
-		case "enter":
-			switch input {
-			case "\\q":
-				return m, tea.Quit
-
-			case "\\p":
-				now := time.Now()
-				if !m.paused {
-					m.paused = true
-					m.pausedAt = now
-					for i := range m.items {
-						if m.items[i].status == Started {
-							m.items[i].frozenDuration = time.Since(m.items[i].createdAt)
-							updateItem(m.db, m.items[i])
-						}
-					}
-				} else {
-					elapsedPaused := now.Sub(m.pausedAt)
-					for i := range m.items {
-						if m.items[i].status == Started {
-							m.items[i].createdAt = m.items[i].createdAt.Add(elapsedPaused)
-							updateItem(m.db, m.items[i])
-						}
-					}
-					m.paused = false
-				}
-
-			case "\\r":
-				if m.cursor >= 0 && m.cursor < len(m.items) {
-					item := &m.items[m.cursor]
-					item.createdAt = time.Now()
-					item.frozenDuration = 0
-					item.checkedAt = nil
-					updateItem(m.db, *item)
-				}
-
-			default:
-				if input != "" {
-					now := time.Now()
-					it := item{
-						text:           input,
-						status:         NotStarted,
-						createdAt:      now,
-						frozenDuration: 0,
-					}
-					m.items = append(m.items, it)
-					saveItem(m.db, it)
-				}
-			}
-			m.input.SetValue("")
-
 		case " ":
-			if inputIsEmpty && len(m.items) > 0 {
+			if m.selectedTaskID != 0 && len(m.items) > 0 {
 				i := &m.items[m.cursor]
-				switch i.status {
+				switch i.Status {
 				case NotStarted:
-					i.status = Started
-					if i.frozenDuration > 0 {
-						i.createdAt = time.Now().Add(-i.frozenDuration)
-					} else {
-						i.createdAt = time.Now()
-					}
-					i.checkedAt = nil
+					i.Status = Started
+					i.CreatedAt = time.Now()
 				case Started:
-					if m.paused {
-						i.checkedAt = ptr(i.createdAt.Add(i.frozenDuration))
-					} else {
-						i.checkedAt = ptr(time.Now())
-					}
-					i.frozenDuration = i.checkedAt.Sub(i.createdAt)
-					i.status = Done
+					i.Status = Done
+					now := time.Now()
+					i.CheckedAt = &now
+					i.FrozenDuration = now.Sub(i.CreatedAt)
 				case Done:
-					i.status = NotStarted
-					// Do NOT reset createdAt or frozenDuration
+					i.Status = NotStarted
 				}
-				updateItem(m.db, *i)
-				return m, nil
+				m.db.Exec("UPDATE items SET status = ?, created_at = ?, checked_at = ?, frozen_duration = ? WHERE id = ?",
+					i.Status,
+					i.CreatedAt.Format(time.RFC3339),
+					func() string {
+						if i.CheckedAt != nil {
+							return i.CheckedAt.Format(time.RFC3339)
+						}
+						return ""
+					}(),
+					i.FrozenDuration,
+					i.ID,
+				)
+				updateTaskStatus(m.db, m.selectedTaskID)
 			}
 		}
-
-	case tickMsg:
-		return m, tick()
 	}
-
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
 }
@@ -257,58 +290,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var b strings.Builder
 	b.WriteString("Checklist:\n\n")
-
-	start := 0
-	end := len(m.items)
-
-	if m.viewportHeight > 0 && len(m.items) > m.viewportHeight {
-		if m.cursor >= m.viewportHeight {
-			start = m.cursor - m.viewportHeight + 1
-		}
-		end = start + m.viewportHeight
-		if end > len(m.items) {
-			end = len(m.items)
-		}
-	}
-
-	for i := start; i < end; i++ {
-		it := m.items[i]
-		cursor := " "
-		if i == m.cursor {
-			cursor = ">"
-		}
-		var icon string
-		switch it.status {
-		case NotStarted:
-			icon = "[ ]"
-		case Started:
-			icon = "[>]"
-		case Done:
-			icon = "[x]"
-		}
-		var duration time.Duration
-		if it.status == Done && it.checkedAt != nil {
-			duration = it.frozenDuration
-		} else if it.status == Started {
-			if m.paused {
-				duration = it.frozenDuration
-			} else {
-				duration = time.Since(it.createdAt)
+	if m.selectedTaskID == 0 {
+		for i, t := range m.tasks {
+			cursor := " "
+			if i == m.cursor {
+				cursor = ">"
 			}
-		} else {
-			duration = it.frozenDuration
+			statusStr := map[itemStatus]string{NotStarted: "[ ]", Started: "[>]", Done: "[x]"}[t.Status]
+			b.WriteString(fmt.Sprintf("%s %s %s - %s\n", cursor, statusStr, t.Code, t.Title))
 		}
-		line := fmt.Sprintf("%s %s %s (%s)", cursor, icon, it.text, duration.Round(time.Second))
-		b.WriteString(line + "\n")
+		b.WriteString("\n" + m.input.View())
+		b.WriteString("\n\n↑/↓ to move • [Enter] to select • \\d to delete • esc to go back • \\q to quit")
+	} else {
+		for i, it := range m.items {
+			cursor := " "
+			if i == m.cursor {
+				cursor = ">"
+			}
+			statusStr := map[itemStatus]string{NotStarted: "[ ]", Started: "[>]", Done: "[x]"}[it.Status]
+			duration := it.FrozenDuration
+			if it.Status == Started && !m.paused {
+				duration = time.Since(it.CreatedAt)
+			}
+			b.WriteString(fmt.Sprintf("%s %s %s (%s)\n", cursor, statusStr, it.Text, duration.Round(time.Second)))
+		}
+		b.WriteString("\n" + m.input.View())
+		b.WriteString("\n\n↑/↓ to move • [Space] to toggle • esc to go back • \\d to delete • \\q to quit")
 	}
-
-	status := ""
-	if m.paused {
-		status = " ⏸ PAUSED"
-	}
-
-	b.WriteString("\n" + m.input.View())
-	b.WriteString(fmt.Sprintf("\n\n↑/↓ to move • [Space] to toggle status • [Enter] to add • \\q to quit • \\p to pause • \\r to restart%s", status))
 	return b.String()
 }
 
