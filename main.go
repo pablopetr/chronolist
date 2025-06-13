@@ -1,10 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite" // <- Aqui estava o erro de sintaxe
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,6 +36,7 @@ type model struct {
 	viewportHeight int
 	paused         bool
 	pausedAt       time.Time
+	db             *sql.DB
 }
 
 type tickMsg time.Time
@@ -47,18 +51,83 @@ func ptr(t time.Time) *time.Time {
 	return &t
 }
 
+func openDB() (*sql.DB, error) {
+	return sql.Open("sqlite", "./checklist.db")
+}
+
+func loadItems(db *sql.DB) []item {
+	items := []item{}
+	rows, err := db.Query("SELECT text, status, created_at, checked_at, frozen_duration FROM items")
+	if err != nil {
+		return items
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var it item
+		var createdAt, checkedAtStr string
+		rows.Scan(&it.text, &it.status, &createdAt, &checkedAtStr, &it.frozenDuration)
+		it.createdAt, _ = time.Parse(time.RFC3339, createdAt)
+		if checkedAtStr != "" {
+			t, _ := time.Parse(time.RFC3339, checkedAtStr)
+			it.checkedAt = &t
+		}
+		items = append(items, it)
+	}
+	return items
+}
+
+func saveItem(db *sql.DB, it item) {
+	var checkedAtStr string
+	if it.checkedAt != nil {
+		checkedAtStr = it.checkedAt.Format(time.RFC3339)
+	}
+	_, _ = db.Exec(`
+		INSERT INTO items (text, status, created_at, checked_at, frozen_duration)
+		VALUES (?, ?, ?, ?, ?)
+	`, it.text, it.status, it.createdAt.Format(time.RFC3339), checkedAtStr, it.frozenDuration)
+}
+
+func updateItem(db *sql.DB, it item) {
+	var checkedAtStr string
+	if it.checkedAt != nil {
+		checkedAtStr = it.checkedAt.Format(time.RFC3339)
+	}
+	_, _ = db.Exec(`
+		UPDATE items SET status=?, created_at=?, checked_at=?, frozen_duration=? WHERE text=?
+	`, it.status, it.createdAt.Format(time.RFC3339), checkedAtStr, it.frozenDuration, it.text)
+}
+
 func initialModel() model {
+	db, err := openDB()
+	if err != nil {
+		fmt.Println("Failed to open DB:", err)
+		os.Exit(1)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			text TEXT,
+			status INTEGER,
+			created_at TEXT,
+			checked_at TEXT,
+			frozen_duration INTEGER
+		);
+	`)
+	if err != nil {
+		fmt.Println("Failed to create table:", err)
+		os.Exit(1)
+	}
+
 	input := textinput.New()
 	input.Placeholder = "Add new item"
 	input.Focus()
 
 	return model{
-		items: []item{
-			{"Buy milk", NotStarted, time.Now(), nil, 0},
-			{"Learn Go", NotStarted, time.Now(), nil, 0},
-			{"Write checklist app", NotStarted, time.Now(), nil, 0},
-		},
+		items: loadItems(db),
 		input: input,
+		db:    db,
 	}
 }
 
@@ -110,6 +179,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for i := range m.items {
 						if m.items[i].status == Started {
 							m.items[i].frozenDuration = time.Since(m.items[i].createdAt)
+							updateItem(m.db, m.items[i])
 						}
 					}
 				} else {
@@ -117,20 +187,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for i := range m.items {
 						if m.items[i].status == Started {
 							m.items[i].createdAt = m.items[i].createdAt.Add(elapsedPaused)
+							updateItem(m.db, m.items[i])
 						}
 					}
 					m.paused = false
 				}
 
+			case "\\r":
+				if m.cursor >= 0 && m.cursor < len(m.items) {
+					item := &m.items[m.cursor]
+					item.createdAt = time.Now()
+					item.frozenDuration = 0
+					item.checkedAt = nil
+					updateItem(m.db, *item)
+				}
+
 			default:
 				if input != "" {
 					now := time.Now()
-					m.items = append(m.items, item{
+					it := item{
 						text:           input,
 						status:         NotStarted,
 						createdAt:      now,
 						frozenDuration: 0,
-					})
+					}
+					m.items = append(m.items, it)
+					saveItem(m.db, it)
 				}
 			}
 			m.input.SetValue("")
@@ -159,6 +241,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					i.status = NotStarted
 					// Do NOT reset createdAt or frozenDuration
 				}
+				updateItem(m.db, *i)
 				return m, nil
 			}
 		}
@@ -199,7 +282,7 @@ func (m model) View() string {
 		case NotStarted:
 			icon = "[ ]"
 		case Started:
-			icon = "[>]" // alternative to emoji
+			icon = "[>]"
 		case Done:
 			icon = "[x]"
 		}
@@ -225,7 +308,7 @@ func (m model) View() string {
 	}
 
 	b.WriteString("\n" + m.input.View())
-	b.WriteString(fmt.Sprintf("\n\n↑/↓ to move • [Space] to toggle status • [Enter] to add • \\q to quit • \\p to pause%s", status))
+	b.WriteString(fmt.Sprintf("\n\n↑/↓ to move • [Space] to toggle status • [Enter] to add • \\q to quit • \\p to pause • \\r to restart%s", status))
 	return b.String()
 }
 
