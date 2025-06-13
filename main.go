@@ -18,9 +18,10 @@ type item struct {
 }
 
 type model struct {
-	items  []item
-	cursor int
-	input  textinput.Model
+	items          []item
+	cursor         int
+	input          textinput.Model
+	viewportHeight int
 }
 
 type tickMsg time.Time
@@ -59,6 +60,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.viewportHeight = msg.Height - 4
+		return m, nil
 
 	case tea.KeyMsg:
 		inputIsEmpty := strings.TrimSpace(m.input.Value()) == ""
@@ -121,23 +126,35 @@ func (m model) View() string {
 	var b strings.Builder
 	b.WriteString("Checklist:\n\n")
 
-	for i, it := range m.items {
+	start := 0
+	end := len(m.items)
+
+	if m.viewportHeight > 0 && len(m.items) > m.viewportHeight {
+		if m.cursor >= m.viewportHeight {
+			start = m.cursor - m.viewportHeight + 1
+		}
+		end = start + m.viewportHeight
+		if end > len(m.items) {
+			end = len(m.items)
+		}
+	}
+
+	for i := start; i < end; i++ {
+		it := m.items[i]
 		cursor := " "
-		if m.cursor == i {
+		if i == m.cursor {
 			cursor = ">"
 		}
 		check := "[ ]"
 		if it.checked {
 			check = "[x]"
 		}
-
 		var duration time.Duration
 		if it.checkedAt != nil {
 			duration = it.checkedAt.Sub(it.createdAt)
 		} else {
 			duration = time.Since(it.createdAt)
 		}
-
 		line := fmt.Sprintf("%s %s %s (%s)", cursor, check, it.text, duration.Round(time.Second))
 		b.WriteString(line + "\n")
 	}
@@ -148,7 +165,7 @@ func (m model) View() string {
 }
 
 func main() {
-	if err := tea.NewProgram(initialModel()).Start(); err != nil {
+	if err := tea.NewProgram(initialModel(), tea.WithAltScreen()).Start(); err != nil {
 		fmt.Println("Error running program:", err)
 		os.Exit(1)
 	}
