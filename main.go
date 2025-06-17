@@ -253,7 +253,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 		case " ":
-			if m.selectedTaskID != 0 && len(m.items) > 0 {
+			if m.selectedTaskID != 0 && len(m.items) > 0 && strings.TrimSpace(m.input.Value()) == "" {
 				i := &m.items[m.cursor]
 				switch i.Status {
 				case NotStarted:
@@ -283,7 +283,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	m.input, cmd = m.input.Update(msg)
+
+	if ks, ok := msg.(tea.KeyMsg); ok && ks.String() == " " && strings.TrimSpace(m.input.Value()) == "" {
+		// Não atualiza o input para evitar adicionar espaço nele
+	} else {
+		m.input, cmd = m.input.Update(msg)
+	}
+
 	return m, cmd
 }
 
