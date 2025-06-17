@@ -176,15 +176,44 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.viewportHeight = msg.Height - 4
 		return m, nil
+
+	case tickMsg:
+		return m, tick()
+
 	case tea.KeyMsg:
 		input := strings.TrimSpace(m.input.Value())
+
 		if input == "\\q" {
 			return m, tea.Quit
-		} else if input == "\\d" {
+		}
+
+		if input == "\\r" {
+			if m.selectedTaskID != 0 && len(m.items) > 0 {
+				i := &m.items[m.cursor]
+				now := time.Now()
+				i.Status = Started
+				i.CreatedAt = now
+				i.CheckedAt = nil
+				i.FrozenDuration = 0
+				m.db.Exec("UPDATE items SET status = ?, created_at = ?, checked_at = ?, frozen_duration = ? WHERE id = ?",
+					i.Status,
+					now.Format(time.RFC3339),
+					nil,
+					0,
+					i.ID,
+				)
+				updateTaskStatus(m.db, m.selectedTaskID)
+				m.input.SetValue("")
+				return m, nil
+			}
+		}
+
+		if input == "\\d" {
 			if m.selectedTaskID == 0 && len(m.tasks) > 0 {
 				taskID := m.tasks[m.cursor].ID
 				deleteTask(m.db, taskID)
@@ -206,9 +235,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+
 		case "enter":
 			if m.selectedTaskID == 0 {
 				if len(m.tasks) > 0 && input == "" {
@@ -236,29 +267,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.input.SetValue("")
 				}
 			}
+
 		case "esc":
 			m.selectedTaskID = 0
 			m.items = nil
 			m.input.Placeholder = "Add new task"
 			m.input.SetValue("")
 			m.tasks = loadTasks(m.db)
+
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}
+
 		case "down":
 			if m.selectedTaskID == 0 && m.cursor < len(m.tasks)-1 {
 				m.cursor++
 			} else if m.selectedTaskID != 0 && m.cursor < len(m.items)-1 {
 				m.cursor++
 			}
+
 		case " ":
 			if m.selectedTaskID != 0 && len(m.items) > 0 && strings.TrimSpace(m.input.Value()) == "" {
 				i := &m.items[m.cursor]
 				switch i.Status {
 				case NotStarted:
 					i.Status = Started
-					i.CreatedAt = time.Now()
 				case Started:
 					i.Status = Done
 					now := time.Now()
@@ -267,9 +301,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case Done:
 					i.Status = NotStarted
 				}
-				m.db.Exec("UPDATE items SET status = ?, created_at = ?, checked_at = ?, frozen_duration = ? WHERE id = ?",
+				m.db.Exec("UPDATE items SET status = ?, checked_at = ?, frozen_duration = ? WHERE id = ?",
 					i.Status,
-					i.CreatedAt.Format(time.RFC3339),
 					func() string {
 						if i.CheckedAt != nil {
 							return i.CheckedAt.Format(time.RFC3339)
@@ -285,7 +318,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if ks, ok := msg.(tea.KeyMsg); ok && ks.String() == " " && strings.TrimSpace(m.input.Value()) == "" {
-		// Não atualiza o input para evitar adicionar espaço nele
 	} else {
 		m.input, cmd = m.input.Update(msg)
 	}
